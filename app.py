@@ -1,14 +1,23 @@
 # app.py
 import requests
+import re
+import os
+import smtplib, ssl
 from flask import Flask, request
 from dotenv import load_dotenv
 load_dotenv()
 from bot_logic import qa_chain
 
-PAGE_ACCESS_TOKEN = "EAAOpMh623y8BPDZClaLvN57q4ZBv2PvZB4u60r6srWJaRqenZCwIRvJb7yQ8vpTtpTWOFOGE5r25eS6YOOv5tpZCasPKTHQDzZALmrcwvP98BzflDRdBOpeRphPps2Lgahi2nDkZANiyI4Qf4sX2qPkmYR2MdlVkYg4IbZBRDTc8GuwfkJdOfEpGg50Udt9P4HUiIx3zEu2jdGN72CYC3CQq3KbI8AZDZD"
+# --- Configuration ---
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
 VERIFY_TOKEN = "saphiredent-secret-token"
 PAGE_ID = "649673271573699"
 GRAPH_API_URL = f"https://graph.facebook.com/v20.0/{PAGE_ID}/messages"
+
+# --- Email Configuration ---
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
+RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 
 app = Flask(__name__)
 
@@ -21,13 +30,32 @@ def send_reply(sender_id, message_text):
     data = {"recipient": {"id": sender_id}, "message": {"text": message_text}}
     requests.post(GRAPH_API_URL, params=params, headers=headers, json=data)
 
+def send_email_report(contact_message):
+    if not all([SENDER_EMAIL, SENDER_PASSWORD, RECEIVER_EMAIL]):
+        print("Email credentials not set. Skipping email report.")
+        return
+
+    subject = "New Lead from Meta Chatbot (Manual Entry)"
+    body = f"A new potential client has provided their contact information directly in the chat:\n\n---\n{contact_message}\n---"
+    message = f"Subject: {subject}\n\n{body}"
+
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, message.encode('utf-8'))
+            print("Successfully sent email report.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
+        # ... (GET request logic remains the same)
         mode = request.args.get('hub.mode')
         token = request.args.get('hub.verify_token')
         challenge = request.args.get('hub.challenge')
-        if mode == 'subscribe' and token == "saphiredent-secret-token": # Direct comparison for safety
+        if mode == 'subscribe' and token == VERIFY_TOKEN:
             return challenge, 200
         else:
             return 'Verification token mismatch', 403
@@ -41,7 +69,23 @@ def webhook():
                         sender_id = message["sender"]["id"]
                         message_text = message["message"].get("text", "").strip()
 
-                        ai_response = qa_chain.invoke({"question": message_text})
+                        # --- New Advanced Contact Info Detection Logic ---
+
+                        # Check for the specific keywords of a form submission
+                        contains_contact_keywords = "full_name:" in message_text.lower() and "email:" in message_text.lower() and "phone_number:" in message_text.lower()
+
+                        # Check for the exclusionary phrase
+                        is_from_form = "filled in your form" in message_text.lower()
+
+                        instruction = ""
+                        if contains_contact_keywords and not is_from_form:
+                            # If it looks like contact info AND is NOT from the form, send an email.
+                            send_email_report(message_text)
+                            instruction = "The user has provided their contact info. Thank them and confirm a consultant will be in touch."
+
+                        final_question = f"INTERNAL INSTRUCTION: {instruction}\n\nUSER MESSAGE: {message_text}"
+
+                        ai_response = qa_chain.invoke({"question": final_question})
                         reply_text = ai_response.get("answer", "Sorry, I'm having a little trouble right now.")
                         send_reply(sender_id, reply_text)
         return 'EVENT_RECEIVED', 200
